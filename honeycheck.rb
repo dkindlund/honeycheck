@@ -192,6 +192,8 @@ class Honeycheck
 
   # Process mail.
   def process_mail(pop)
+    # Create a Message ID to GUID Hashtable.
+    @GUIDS = {} 
     # Iterate through each AMQP profile found.
     @CONFIG['amqp'].each_pair do |amqp_profile, amqp_config|
       EM.run do
@@ -213,15 +215,17 @@ class Honeycheck
                                             :auto_delete => false,
                                             :internal    => false,
                                             :nowait      => false})
-  
+ 
         pop.each_mail do |message|
           @LOG.info "=== Message ===" 
           mail = TMail::Mail.parse(message.pop)
+          @LOG.debug "ID: " + mail.message_id.to_s
           @LOG.debug "Sender: " + mail.sender_addr.to_s
           @LOG.info "From: " + mail.from.to_s
           @LOG.debug "Reply To: " + mail.reply_to.to_s
           @LOG.debug "To: " + mail.to.to_s
           @LOG.info "Subject: " + mail.subject.to_s
+          @LOG.info "Importance: " + mail.header_string("Importance").to_s
           @LOG.debug "Date: " + mail.date.utc.to_s
   
           # Figure out who should be notified.
@@ -237,8 +241,8 @@ class Honeycheck
           @LOG.info "URLs Found: " + urls.size.to_s
 
           # Sanity Check: If no URLs were found, then output an error to the
-          # sender.
-          if urls.size <= 0
+          # sender (if need be).
+          if ((urls.size <= 0) && (@CONFIG['pop3'][@POP3_PROFILE]['alerts']))
             Net::SMTP.start(@CONFIG['smtp']['gateway'],
                             @CONFIG['smtp']['port'], 
                             Socket.gethostname) do |smtp|
@@ -251,7 +255,16 @@ class Honeycheck
               reply.date = Time.now.utc
               reply.subject =  "[" + Socket.gethostname + "] " + @CONFIG['smtp']['error_subject_prefix'] + mail.subject
               reply.body = @CONFIG['smtp']['error_message_body']
-              notifiers << @CONFIG['smtp']['admin_address']
+
+              # Check if original sender should be suppressed.
+              if (amqp_config['priority_maps'].key?(notifiers.first) &&
+                  amqp_config['priority_maps'][notifiers.first].key?('suppress_errors') &&
+                  amqp_config['priority_maps'][notifiers.first]['suppress_errors'])
+                notifiers = [ @CONFIG['smtp']['admin_address'] ]
+              else
+                notifiers << @CONFIG['smtp']['admin_address']
+              end
+
               smtp.send_message reply.to_s, reply.from, notifiers
   
               if @CONFIG['smtp']['forward_errors']
@@ -264,46 +277,114 @@ class Honeycheck
                 smtp.send_message forward.to_s, forward.from, forward.to
               end
             end
+          end
+
+          # If there are no URLs to process, then skip over this interation of the loop.
+          if (urls.size <= 0)
             next
           end
   
-  
-          # Figure out which priority to use.
+          # Figure out which priority, routing_key, and max_urls_per_job to use.
           priority = amqp_config['default_priority']
           routing_key = amqp_config['default_routing_key']
-          if amqp_config['priority_maps'].key?(mail.from.first)
-            priority = amqp_config['priority_maps'][mail.from.first]['priority']
-            routing_key = amqp_config['priority_maps'][mail.from.first]['routing_key']
+          max_urls_per_job = amqp_config['max_urls_per_job']
+
+          # Check if the "Importance" header was specified.
+          if mail.header_string("Importance").to_s == 'high'
+            priority = amqp_config['high_priority']
+            routing_key = amqp_config['high_priority_routing_key']
+          elsif mail.header_string("Importance").to_s == 'low'
+            priority = amqp_config['low_priority']
+            routing_key = amqp_config['low_priority_routing_key']
+          end
+
+          # Next, check to see if we have any priority overrides defined.
+          if amqp_config['priority_maps'].key?(notifiers.first)
+            if amqp_config['priority_maps'][notifiers.first].key?('priority')
+              priority = amqp_config['priority_maps'][notifiers.first]['priority']
+            end
+            if amqp_config['priority_maps'][notifiers.first].key?('routing_key')
+              routing_key = amqp_config['priority_maps'][notifiers.first]['routing_key']
+            end
+            if amqp_config['priority_maps'][notifiers.first].key?('max_urls_per_job')
+              max_urls_per_job = amqp_config['priority_maps'][notifiers.first]['max_urls_per_job']
+            end
           end
  
           # Construct the job. 
           event = {
             'job' => {
               'created_at' => mail.date.utc.iso8601,
-              'uuid'       => Guid.new.to_s,
               'job_source' => {
                 'name'     => mail.friendly_from,
                 'protocol' => 'smtp',
               },
-              'job_alerts' => notifiers.map {|from| { 'protocol' => 'smtp',
-                                                      'address'  => from }},
-              'urls'       => urls.map {|url| { 'url'        => url,
-                                                'priority'   => priority,
-                                                'url_status' => {'status' => 'queued'} }},
+#              'job_alerts' => notifiers.map {|from| { 'protocol' => 'smtp',
+#                                                      'address'  => from }},
             } 
           }
-  
+
+          # Add job_alerts if allowed.
+          if @CONFIG['pop3'][@POP3_PROFILE]['alerts']
+              event['job']['job_alerts'] = notifiers.map {|from| { 'protocol' => 'smtp',
+                                                                   'address'  => from }}
+          end
+
           # Figure out if we know the job source group.
           domain = mail.from.first.split('@').last
           if @CONFIG['groups'].key?(domain)
             event['job']['job_source']['group'] = { 'name' => @CONFIG['groups'][domain] }
           end
- 
+
+          # Publish the job(s), if need be. 
           if amqp_config['publish_messages'] 
-            @LOG.info "[#{amqp_profile}] Publishing Job Using Key: " + routing_key
-            @LOG.debug JSON.pretty_generate(event)
-            events_exchange.publish(event.to_json, {:routing_key => routing_key, :persistent => true})
-            @LOG.info "[#{amqp_profile}] Published Job"
+            # Figure out if our number of URLs exceeds maximum per job.
+            if urls.size > max_urls_per_job
+
+              # Split the URLs into smaller jobs.
+              index = 0
+              counter = 0
+              while (index < urls.size)
+                # Figure out if a GUID has already been assigned.
+                if !@GUIDS.key?(mail.message_id.to_s)
+                  event['job']['uuid'] = Guid.new.to_s
+                  @GUIDS[mail.message_id.to_s] = []
+                  @GUIDS[mail.message_id.to_s][counter] = event['job']['uuid']
+                elsif @GUIDS[mail.message_id.to_s][counter].nil? 
+                  event['job']['uuid'] = Guid.new.to_s
+                  @GUIDS[mail.message_id.to_s][counter] = event['job']['uuid']
+                else
+                  event['job']['uuid'] = @GUIDS[mail.message_id.to_s][counter]
+                end
+                event['job']['urls'] = urls[index..(index+max_urls_per_job-1)].map {|url| { 'url'        => url,
+                                                                                            'priority'   => priority,
+                                                                                            'url_status' => {'status' => 'queued'} }}
+                @LOG.info "[#{amqp_profile}] Publishing Job (#{event['job']['uuid']}) Using Key (#{routing_key})"
+                @LOG.debug JSON.pretty_generate(event)
+                events_exchange.publish(event.to_json, {:routing_key => routing_key, :persistent => true})
+                @LOG.info "[#{amqp_profile}] Published Job (#{event['job']['uuid']})"
+                index += max_urls_per_job
+                counter += 1
+              end
+
+            else
+
+              # Figure out if a GUID has already been assigned.
+              if !@GUIDS.key?(mail.message_id.to_s)
+                event['job']['uuid'] = Guid.new.to_s
+                @GUIDS[mail.message_id.to_s] = [ event['job']['uuid'] ]
+              else
+                event['job']['uuid'] = @GUIDS[mail.message_id.to_s].first
+              end
+
+              event['job']['urls'] =  urls.map {|url| { 'url'        => url,
+                                                        'priority'   => priority,
+                                                        'url_status' => {'status' => 'queued'} }}
+              @LOG.info "[#{amqp_profile}] Publishing Job (#{event['job']['uuid']}) Using Key (#{routing_key})"
+              @LOG.debug JSON.pretty_generate(event)
+              events_exchange.publish(event.to_json, {:routing_key => routing_key, :persistent => true})
+              @LOG.info "[#{amqp_profile}] Published Job (#{event['job']['uuid']})"
+            end
           end
         end
   
