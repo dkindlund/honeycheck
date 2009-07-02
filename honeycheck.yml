@@ -1,0 +1,64 @@
+# Email Collector Configuration Options
+
+daemonize: true
+
+log:
+  level:  INFO
+  file:   honeycheck.log
+
+pid_file: honeycheck.pid
+
+# List of scheme types to extract.
+protocols_supported:
+- http
+- https
+
+# List of valid email domains to group name mappings.
+groups:
+  domain.org: DOMAIN
+
+pop3:
+  # List of POP3 server profiles.
+  hcinternal:
+    server:             pop3.server
+    username:           username
+    # Note: This password is Base64.encode64()
+    password:           dGVzdA== # test
+    purge_messages:     true
+    # How long should we sleep (in seconds), between consecutive checks.
+    repeat_check_delay: 60
+
+amqp:
+  # List of AMQP server profiles.
+  rabbitmq:
+    publish_messages:     true
+    server:               127.0.0.1
+    port:                 5672
+    username:             honeyclient
+    password:             passw0rd
+    vhost:                /honeyclient.org
+    events_exchange_name: events
+    default_routing_key:  500.job.create.job.urls.job_alerts
+    default_priority:     500
+    priority_maps:
+      user@domain.net:
+        routing_key:      400.job.create.job.urls.job_alerts
+        priority:         400
+
+# Global SMTP Settings.
+smtp:
+  gateway:        smtp.server
+  port:           25
+  from:           noreply
+  forward_errors: true
+  admin_address:  admin@localhost
+  error_message_body: |
+    Unfortunately, we were unable to parse your request to the honeyclient system.  Please review your original message and verify it contained at least one URL.  If you believe this is an error, please cont
+    act admin@localhost and forward the original message.
+
+    Status:  Error
+    Job ID:  N/A
+    Created: N/A
+    # URLs:  0
+
+  error_subject_prefix: "Job Error - RE: "
