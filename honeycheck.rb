@@ -226,7 +226,7 @@ class Honeycheck
           @LOG.debug "To: " + mail.to.to_s
           @LOG.info "Subject: " + mail.subject.to_s
           @LOG.info "Importance: " + mail.header_string("Importance").to_s
-          @LOG.debug "Date: " + mail.date.utc.to_s
+          @LOG.debug "Date: " + (mail.date.nil? ? Time.now.utc.to_s : mail.date.utc.to_s)
   
           # Figure out who should be notified.
           notifiers = mail.from
@@ -236,7 +236,12 @@ class Honeycheck
   
           # Parse the message body and extract all URLs.
           urls = parse_body(mail)
-          urls.flatten!.uniq!
+          urls.flatten!
+          if urls.nil?
+            urls = []
+          else
+            urls.uniq!
+          end
 
           @LOG.info "URLs Found: " + urls.size.to_s
 
@@ -314,13 +319,11 @@ class Honeycheck
           # Construct the job. 
           event = {
             'job' => {
-              'created_at' => mail.date.utc.iso8601,
+              'created_at' => (mail.date.nil? ? Time.now.utc.iso8601 : mail.date.utc.iso8601),
               'job_source' => {
                 'name'     => mail.friendly_from,
                 'protocol' => 'smtp',
               },
-#              'job_alerts' => notifiers.map {|from| { 'protocol' => 'smtp',
-#                                                      'address'  => from }},
             } 
           }
 
@@ -457,4 +460,5 @@ begin
   Honeycheck.new(ARGV[0]).start
 rescue
   Logger.new(STDOUT).warn $!.to_s
+  retry
 end
