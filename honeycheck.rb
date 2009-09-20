@@ -39,9 +39,12 @@ class Honeycheck
   CONFIG_FILE = 'honeycheck.yml'
 
   # Initialize our instance variables.
-  def initialize(pop3_profile = nil)
+  def initialize(config_file = nil, pop3_profile = nil)
     # Load the configuration file.
-    @CONFIG = YAML.load(IO.read(File.join(CONFIG_FILE)))
+    if config_file.nil?
+      config_file = CONFIG_FILE
+    end
+    @CONFIG = YAML.load(IO.read(File.join(config_file)))
 
     # Create a new logger.
     if @CONFIG['daemonize']
@@ -66,7 +69,7 @@ class Honeycheck
       else
         puts "- Warning: No valid profiles found!"
       end
-      puts "- See the '" + CONFIG_FILE + "' configuration file for details.\n\n"
+      puts "- See the '" + config_file.to_s + "' configuration file for details.\n\n"
       exit
     end
 
@@ -247,7 +250,7 @@ class Honeycheck
 
           # Sanity Check: If no URLs were found, then output an error to the
           # sender (if need be).
-          if ((urls.size <= 0) && (@CONFIG['pop3'][@POP3_PROFILE]['alerts']))
+          if ((urls.size <= 0) && (@CONFIG['pop3'][@POP3_PROFILE]['alerts']) && !notifiers.nil? && (!notifiers.is_a?(Array) || !notifiers.empty?))
             Net::SMTP.start(@CONFIG['smtp']['gateway'],
                             @CONFIG['smtp']['port'], 
                             Socket.gethostname) do |smtp|
@@ -304,7 +307,7 @@ class Honeycheck
           end
 
           # Next, check to see if we have any priority overrides defined.
-          if amqp_config['priority_maps'].key?(notifiers.first)
+          if !notifiers.nil? && (!notifiers.is_a?(Array) || !notifiers.empty?) && amqp_config['priority_maps'].key?(notifiers.first)
             if amqp_config['priority_maps'][notifiers.first].key?('priority')
               priority = amqp_config['priority_maps'][notifiers.first]['priority']
             end
@@ -359,9 +362,10 @@ class Honeycheck
                 else
                   event['job']['uuid'] = @GUIDS[mail.message_id.to_s][counter]
                 end
-                event['job']['urls'] = urls[index..(index+max_urls_per_job-1)].map {|url| { 'url'        => url,
-                                                                                            'priority'   => priority,
-                                                                                            'url_status' => {'status' => 'queued'} }}
+                event['job']['urls'] = urls[index..(index+max_urls_per_job-1)].map {|url| { 'url'              => url,
+                                                                                            'priority'         => priority,
+                                                                                            'url_status'       => {'status' => 'queued'},
+                                                                                            'reuse_browser_id' => 1 }}
                 @LOG.info "[#{amqp_profile}] Publishing Job (#{event['job']['uuid']}) Using Key (#{routing_key})"
                 @LOG.debug JSON.pretty_generate(event)
                 events_exchange.publish(event.to_json, {:routing_key => routing_key, :persistent => true})
@@ -380,9 +384,10 @@ class Honeycheck
                 event['job']['uuid'] = @GUIDS[mail.message_id.to_s].first
               end
 
-              event['job']['urls'] =  urls.map {|url| { 'url'        => url,
-                                                        'priority'   => priority,
-                                                        'url_status' => {'status' => 'queued'} }}
+              event['job']['urls'] =  urls.map {|url| { 'url'              => url,
+                                                        'priority'         => priority,
+                                                        'url_status'       => {'status' => 'queued'},
+                                                        'reuse_browser_id' => 1 }}
               @LOG.info "[#{amqp_profile}] Publishing Job (#{event['job']['uuid']}) Using Key (#{routing_key})"
               @LOG.debug JSON.pretty_generate(event)
               events_exchange.publish(event.to_json, {:routing_key => routing_key, :persistent => true})
@@ -454,11 +459,4 @@ class Honeycheck
       check_mailbox
     end
   end
-end
-
-begin
-  Honeycheck.new(ARGV[0]).start
-rescue
-  Logger.new(STDOUT).warn $!.to_s
-  retry
 end
