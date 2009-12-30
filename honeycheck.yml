@@ -47,7 +47,7 @@ amqp:
     server:                    127.0.0.1
     port:                      5672
     username:                  honeyclient
-    password:                  passw0rd
+    password:                  password
     vhost:                     /1.domain.org
     max_urls_per_job:          100
     events_exchange_name:      events
@@ -68,7 +68,7 @@ amqp:
     server:                    127.0.0.1
     port:                      5673
     username:                  honeyclient
-    password:                  passw0rd
+    password:                  password
     vhost:                     /1.domain.org
     max_urls_per_job:          100
     events_exchange_name:      events
